@@ -1,0 +1,161 @@
+from PIL import Image
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torchvision import transforms, datasets
+import torchvision.models as models
+from torch import nn
+from torch import optim
+from sklearn.metrics import classification_report
+from torch.nn import functional as F
+import pdb
+
+nModels = 16
+#This part we just input the dataset
+means = [0.485, 0.456, 0.406]
+stds  = [0.229, 0.224, 0.225]
+#training dataset augmented
+train_data_transform = transforms.Compose([
+        transforms.RandomSizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=means,
+                             std=stds)
+    ])
+
+test_data_transform = transforms.Compose([
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=means,
+                             std=stds)
+    ])
+
+train_dataset = datasets.ImageFolder(root='data_upload_v2/train',
+                                           transform=train_data_transform)
+train_dataset_loader = torch.utils.data.DataLoader(train_dataset,
+                                             batch_size=120, shuffle=True, 
+                                             num_workers=4)
+test_dataset = datasets.ImageFolder(root='data_upload_v2/test',
+                                           transform=test_data_transform)
+test_dataset_loader = torch.utils.data.DataLoader(test_dataset,
+                                             batch_size=120, shuffle=False,
+                                             num_workers=4)
+
+
+xclasses = ('covid', 'non')
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+#functions to show the images
+
+def imshow(img):
+  img[0, :, :] = img[0, :, :] * stds[0] + means[0]
+  img[1, :, :] = img[1, :, :] * stds[1] + means[1]
+  img[2, :, :] = img[2, :, :] * stds[2] + means[2]
+  npimg = img.numpy()
+  plt.imshow(np.transpose(npimg, (1, 2, 0)))
+  plt.show
+
+# get some random training images
+dataiter = iter(train_dataset_loader)
+images, labels = dataiter.next()
+
+#show images
+imshow(torchvision.utils.make_grid(images))
+
+# get log loss function
+crossEntropy = nn.CrossEntropyLoss()
+
+
+
+def test_model(networks, test_dataset_loader):
+  predictionsAll = []
+  for model in networks:
+    model = model.eval()
+    test_loss = 0.
+    samples_correct = 0.
+    total_samples = 0
+    test_steps = 0
+    # loop over samples in test dataset
+    pred = []
+    actual=[]
+    with torch.no_grad():
+        for x, y in test_dataset_loader:
+            x, y = x.cuda(), y.cuda()
+            # keep track or test loss and test accuracy
+            output = model(x)
+            samples_correct += torch.sum(torch.argmax(output, 1) == y).item()
+            total_samples += len(y)
+            loss = crossEntropy(output, y)
+            test_loss += loss.item()
+            test_steps += 1
+            probs = F.softmax(output, dim=1)[:, 1]
+            for p in probs: pred.append(p.item())
+            for l in y: actual.append(l.item())
+        predictionsAll.append(pred)
+    pred = np.mean(np.asarray(predictionsAll), 0)
+
+  # return those
+  print(classification_report(actual, np.round(pred)))
+  return test_loss/test_steps, 100*(samples_correct/total_samples)
+
+# training loop
+
+# define our optimizer
+networks = []
+import copy
+for m in range(nModels):
+  model = models.squeezenet1_1(pretrained=True).cuda()
+  model.fc = nn.Sequential(
+      nn.Dropout(0.4),
+      nn.Linear(512, 2).cuda()
+  )
+  opt = optim.Adam(model.parameters(), lr=0.0001, weight_decay=.00001)
+
+  epochs = 5 #maybe 12 epochs is good
+  model = model.train()
+  classOneFrac = np.mean(train_dataset.targets)
+  classZeroFrac = 1 - classOneFrac
+  crossEntropyNoAverage = nn.CrossEntropyLoss(reduction='none')
+  for epoch in range(epochs):
+
+    train_loss = 0.
+    samples_correct = 0.
+    total_samples = 0
+    train_steps = 0
+    for x, y in train_dataset_loader:
+
+      # put samples on gpu
+      x, y = x.cuda(), y.cuda()
+
+      # get predictions
+      output = model(x)
+      samples_correct += torch.sum(torch.argmax(output, 1) == y).item()
+      total_samples += len(y)
+
+      # compute loss
+      unweightedLoss = crossEntropyNoAverage(output, y)
+      for i in range(len(unweightedLoss)):
+        if y[i].item() == 1:
+          unweightedLoss[i] = unweightedLoss[i] * classZeroFrac
+        else:
+          unweightedLoss[i] = unweightedLoss[i] * classOneFrac
+      loss = torch.mean(unweightedLoss) 
+
+      # compute gradients
+      loss.backward()
+      train_loss += loss.item()
+
+      # do a weight update
+      opt.step()
+
+      # clear the gradeints
+      opt.zero_grad()
+
+      train_steps += 1
+    test_loss, test_acc = test_model(networks + [model], test_dataset_loader)
+    print(m+1, epoch+1, train_loss/ train_steps, 100 * samples_correct / total_samples, test_loss, test_acc)
+
+  networks.append(copy.deepcopy(model))
